@@ -1,0 +1,140 @@
+name: Concat Tablet ARM64 TEST (TEMP SIGNED)
+
+# Manual-only: does not run on every fork update.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: concat-tablet-arm64
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  GGML_NATIVE: "OFF"
+  CONCAT_TABLET_BUILD: "1"
+
+jobs:
+  tablet-arm64:
+    name: Concat Tablet ARM64 disposable-key test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prepare independent tablet package and desktop workspace
+        shell: bash
+        run: |
+          python3 - <<'PYTABLET'
+          from pathlib import Path
+          cargo_path = Path('src/crates/concat-android/Cargo.toml')
+          platform_path = Path('src/crates/concat/src/platform.rs')
+          def change(text, old, new):
+              if text.count(old) != 1:
+                  raise SystemExit('Upstream changed; expected exactly one source match: ' + old[:65])
+              return text.replace(old, new, 1)
+          cargo = cargo_path.read_text()
+          for a, b in (
+              ('package = "app.concat.editor"', 'package = "app.concat.editor.tablet"'),
+              ('apk_name = "Concat"', 'apk_name = "ConcatTablet"'),
+              ('label = "Concat"', 'label = "Concat Tablet"'),
+              ('orientation = "portrait"', 'orientation = "landscape"'),
+          ):
+              cargo = change(cargo, a, b)
+          platform = platform_path.read_text()
+          platform = change(platform, '''pub fn phone() -> bool {
+              cfg!(any(target_os = "android", target_os = "ios"))
+                  || std::env::var_os("CONCAT_PHONE").is_some_and(|value| !value.is_empty() && value != "0")
+          }''', '''pub fn phone() -> bool {
+              // Only this independent ARM64 tablet test opts into the desktop shell.
+              let android_tablet = cfg!(target_os = "android")
+                  && option_env!("CONCAT_TABLET_BUILD") == Some("1");
+              !android_tablet
+                  && (cfg!(any(target_os = "android", target_os = "ios"))
+                      || std::env::var_os("CONCAT_PHONE")
+                          .is_some_and(|value| !value.is_empty() && value != "0"))
+          }''')
+          cargo_path.write_text(cargo)
+          platform_path.write_text(platform)
+          print('Tablet package, landscape and desktop workspace prepared.')
+          PYTABLET
+      - name: Read pinned Rust toolchain
+        id: toolchain
+        shell: bash
+        run: |
+          echo "channel=$(sed -n 's/^channel = "\(.*\)"/\1/p' src/rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
+        with:
+          toolchain: ${{ steps.toolchain.outputs.channel }}
+          targets: aarch64-linux-android
+      - uses: taiki-e/cache-cargo-install-action@9ee83daaa7b96a6fab930949ecf1122bba04a389
+        with:
+          tool: cargo-apk
+      - name: System dependencies
+        run: sudo apt-get update && sudo apt-get install -y cmake libclang-dev
+      - name: Restore FFmpeg cache
+        id: ffmpeg
+        uses: actions/cache/restore@v4
+        with:
+          path: src/vendor/ffmpeg/aarch64-linux-android
+          key: ffmpeg-aarch64-linux-android-${{ hashFiles('src/scripts/ffmpeg-mobile.sh') }}
+      - name: FFmpeg for ARM64
+        if: steps.ffmpeg.outputs.cache-hit != 'true'
+        run: src/scripts/ffmpeg-mobile.sh aarch64-linux-android
+      - name: Save FFmpeg cache
+        if: steps.ffmpeg.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: src/vendor/ffmpeg/aarch64-linux-android
+          key: ${{ steps.ffmpeg.outputs.cache-primary-key }}
+      - name: Android native libraries
+        run: src/scripts/android-libs.sh aarch64-linux-android
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          workspaces: src
+          key: concat-tablet-aarch64-linux-android
+      - name: Generate disposable test signing key
+        shell: bash
+        run: |
+          set -euo pipefail
+          keystore="$RUNNER_TEMP/concat-tablet-test.keystore"
+          keytool -genkeypair -noprompt -keystore "$keystore" \
+            -storepass concat-test -keypass concat-test -alias concat-tablet-test \
+            -keyalg RSA -keysize 2048 -validity 30 \
+            -dname 'CN=Concat Tablet TEST, O=Temporary' >/dev/null 2>&1
+          echo "CARGO_APK_RELEASE_KEYSTORE=$keystore" >> "$GITHUB_ENV"
+          echo 'CARGO_APK_RELEASE_KEYSTORE_PASSWORD=concat-test' >> "$GITHUB_ENV"
+      - name: Compile ARM64 APK
+        working-directory: src
+        shell: bash
+        run: |
+          set -euo pipefail
+          eval "$(scripts/mobile-env.sh aarch64-linux-android)"
+          cargo apk build --release -p concat-android --target aarch64-linux-android 2>&1 | tee build.log
+      - name: Check APK and ELF 16 KB page compatibility
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f src/target/release/apk/ConcatTablet.apk
+          python3 scripts/ci/check-16k-pages.py src/target/release/apk/ConcatTablet.apk
+      - name: Collect build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: concat-tablet-build-log
+          path: src/build.log
+          if-no-files-found: ignore
+          retention-days: 3
+      - name: Stage test APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output
+          cp src/target/release/apk/ConcatTablet.apk output/Concat-Tablet-android-arm64-TEST.apk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Concat-Tablet-ARM64-TEMP-SIGNED
+          path: output/Concat-Tablet-android-arm64-TEST.apk
+          if-no-files-found: error
+          retention-days: 14

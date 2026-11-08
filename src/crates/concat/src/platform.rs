@@ -840,6 +840,34 @@ fn media_kind(extension: &str) -> Option<MediaKind> {
 #[cfg(any(target_os = "android", target_os = "ios"))]
 static FILE_PICKER: std::sync::OnceLock<FilePicker> = std::sync::OnceLock::new();
 
+/// Android's Storage Access Framework folder chooser; the Java side copies
+/// the selected Concat project tree into the tablet app's own storage.
+#[cfg(target_os = "android")]
+pub type ProjectFolderPicker =
+    Box<dyn Fn(Box<dyn FnOnce(Option<PathBuf>) + Send>) + Send + Sync>;
+
+#[cfg(target_os = "android")]
+static PROJECT_FOLDER_PICKER: std::sync::OnceLock<ProjectFolderPicker> =
+    std::sync::OnceLock::new();
+
+#[cfg(target_os = "android")]
+pub fn install_project_folder_picker(picker: ProjectFolderPicker) {
+    let _ = PROJECT_FOLDER_PICKER.set(picker);
+}
+
+#[cfg(target_os = "android")]
+pub fn pick_project_folder_async(
+    on_picked: impl FnOnce(Option<PathBuf>) + Send + 'static,
+) {
+    match PROJECT_FOLDER_PICKER.get() {
+        Some(picker) => picker(Box::new(on_picked)),
+        None => {
+            log::warn!("Android project folder picker is not installed");
+            on_picked(None);
+        }
+    }
+}
+
 /// Installs the picker a phone answers [`pick_files_async`] with. Once;
 /// a second call is ignored.
 #[cfg(any(target_os = "android", target_os = "ios"))]

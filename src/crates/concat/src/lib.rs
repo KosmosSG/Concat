@@ -55,7 +55,9 @@ pub use platform::{
     ExportPublisher, FilePicker, PickKinds, install_export_publisher, install_file_picker,
 };
 #[cfg(target_os = "android")]
-pub use platform::{LinkOpener, install_link_opener};
+pub use platform::{
+    LinkOpener, ProjectFolderPicker, install_link_opener, install_project_folder_picker,
+};
 #[cfg(any(target_os = "android", target_os = "ios"))]
 pub use platform::{MicrophoneAccess, install_microphone_access};
 mod panes;

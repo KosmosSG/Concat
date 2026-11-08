@@ -426,7 +426,7 @@ public class ConcatFiles extends Fragment {
 
     private static String cleanFileName(String name) {
         if (name == null) return "unnamed";
-        name = name.replace('/', '_').replace('\\\\', '_').trim();
+        name = name.replace('/', '_').replace('\\', '_').trim();
         if (name.isEmpty() || name.equals(".") || name.equals("..")) return "unnamed";
         return name;
     }

@@ -16,8 +16,10 @@ import android.net.Uri;
 import android.os.Build;
 import android.os.Environment;
 import android.provider.MediaStore;
+import android.provider.DocumentsContract;
 import android.provider.OpenableColumns;
 import android.util.Log;
+import android.widget.Toast;
 
 import java.io.File;
 import java.io.FileInputStream;
@@ -57,6 +59,7 @@ import java.util.List;
  */
 public class ConcatFiles extends Fragment {
     private static final int REQUEST_PICK = 0xC0C4;
+    private static final int REQUEST_PROJECT_FOLDER = 0xC0C6;
     private static final int REQUEST_MICROPHONE = 0xC0C5;
     private static final String TAG = "concat-files";
 
@@ -209,6 +212,40 @@ public class ConcatFiles extends Fragment {
     /** Registered from Rust: the picked files' paths, or none. */
     public static native void filesPicked(String[] paths);
 
+    /** Returns the copied project's local directory, or null on cancellation. */
+    public static native void projectFolderPicked(String path);
+
+    /** Open Android's native SAF directory picker, not the unavailable desktop dialog. */
+    public static void pickProjectFolder(final Activity activity) {
+        activity.runOnUiThread(new Runnable() {
+            @Override
+            public void run() {
+                ConcatFiles fragment = new ConcatFiles();
+                activity.getFragmentManager().beginTransaction()
+                        .add(fragment, TAG).commitAllowingStateLoss();
+                activity.getFragmentManager().executePendingTransactions();
+                Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE);
+                intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                try {
+                    fragment.startActivityForResult(intent, REQUEST_PROJECT_FOLDER);
+                } catch (Exception e) {
+                    Log.w(TAG, "cannot show project folder picker", e);
+                    fragment.dismissFragment();
+                    Toast.makeText(activity, "Cannot open the Android folder picker",
+                            Toast.LENGTH_LONG).show();
+                    projectFolderPicked(null);
+                }
+            }
+        });
+    }
+
+    private void dismissFragment() {
+        try {
+            getFragmentManager().beginTransaction().remove(this).commitAllowingStateLoss();
+        } catch (Exception ignored) {
+        }
+    }
+
     /**
      * Shows the picker, offering the MIME types in {@code types} - comma
      * separated, "video/*,audio/*" - or every file when it is empty. From
@@ -243,6 +280,22 @@ public class ConcatFiles extends Fragment {
 
     @Override
     public void onActivityResult(int request, int result, Intent data) {
+        if (request == REQUEST_PROJECT_FOLDER) {
+            final Activity activity = getActivity();
+            final Uri tree = result == Activity.RESULT_OK && data != null ? data.getData() : null;
+            dismissFragment();
+            if (activity == null || tree == null) {
+                projectFolderPicked(null);
+                return;
+            }
+            new Thread(new Runnable() {
+                @Override
+                public void run() {
+                    projectFolderPicked(importProjectFolder(activity, tree));
+                }
+            }, "concat-project-import").start();
+            return;
+        }
         if (request != REQUEST_PICK) {
             return;
         }
@@ -290,6 +343,110 @@ public class ConcatFiles extends Fragment {
                 filesPicked(paths.toArray(new String[0]));
             }
         }, TAG).start();
+    }
+
+    /** Copy a SAF project directory to an app-owned path the Rust editor can open. */
+    private static String importProjectFolder(Activity activity, Uri tree) {
+        File imported = null;
+        try {
+            String docId = DocumentsContract.getTreeDocumentId(tree);
+            Uri rootDocument = DocumentsContract.buildDocumentUriUsingTree(tree, docId);
+            if (!hasProjectManifest(activity, tree, docId)) {
+                toast(activity, "Select a Concat project folder containing concat.json");
+                return null;
+            }
+            File base = activity.getExternalFilesDir(null);
+            if (base == null) base = activity.getFilesDir();
+            File root = new File(base, "ImportedProjects");
+            if (!root.exists() && !root.mkdirs()) {
+                throw new IOException("Cannot create ImportedProjects directory");
+            }
+            imported = unique(root, cleanFileName(displayName(activity, rootDocument)));
+            if (!imported.mkdirs()) throw new IOException("Cannot create selected project directory");
+            int[] remaining = {5000}; // Prevent runaway provider trees on a mis-pick.
+            copyProjectChildren(activity, tree, docId, imported, 0, remaining);
+            return imported.getAbsolutePath();
+        } catch (Exception e) {
+            Log.w(TAG, "Cannot import project folder", e);
+            deleteFolder(imported);
+            toast(activity, "Could not import project folder: " + e.getMessage());
+            return null;
+        }
+    }
+
+    private static boolean hasProjectManifest(Activity activity, Uri tree, String id) {
+        Uri children = DocumentsContract.buildChildDocumentsUriUsingTree(tree, id);
+        Cursor cursor = activity.getContentResolver().query(children,
+                new String[] { DocumentsContract.Document.COLUMN_DISPLAY_NAME },
+                null, null, null);
+        if (cursor == null) return false;
+        try {
+            while (cursor.moveToNext()) {
+                String name = cursor.getString(0);
+                if ("concat.json".equals(name) || "wolfcut.json".equals(name)) return true;
+            }
+        } finally {
+            cursor.close();
+        }
+        return false;
+    }
+
+    private static void copyProjectChildren(Activity activity, Uri tree, String parentId,
+                                            File destination, int depth, int[] remaining)
+            throws IOException {
+        if (depth > 20) throw new IOException("Project folder is too deeply nested");
+        Uri children = DocumentsContract.buildChildDocumentsUriUsingTree(tree, parentId);
+        Cursor cursor = activity.getContentResolver().query(children,
+                new String[] { DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+                        DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+                        DocumentsContract.Document.COLUMN_MIME_TYPE }, null, null, null);
+        if (cursor == null) throw new IOException("Could not read selected project folder");
+        try {
+            while (cursor.moveToNext()) {
+                if (--remaining[0] < 0) throw new IOException("Project exceeds 5,000 entries");
+                String id = cursor.getString(0);
+                String name = cleanFileName(cursor.getString(1));
+                String mime = cursor.getString(2);
+                if (id == null) continue;
+                File target = new File(destination, name);
+                if (DocumentsContract.Document.MIME_TYPE_DIR.equals(mime)) {
+                    target = unique(destination, name);
+                    if (!target.mkdirs()) throw new IOException("Cannot create " + name);
+                    copyProjectChildren(activity, tree, id, target, depth + 1, remaining);
+                } else {
+                    Uri document = DocumentsContract.buildDocumentUriUsingTree(tree, id);
+                    target = unique(destination, name);
+                    if (!copy(activity, document, target)) throw new IOException("Cannot copy " + name);
+                }
+            }
+        } finally {
+            cursor.close();
+        }
+    }
+
+    private static String cleanFileName(String name) {
+        if (name == null) return "unnamed";
+        name = name.replace('/', '_').replace('\\\\', '_').trim();
+        if (name.isEmpty() || name.equals(".") || name.equals("..")) return "unnamed";
+        return name;
+    }
+
+    private static void deleteFolder(File file) {
+        if (file == null || !file.exists()) return;
+        if (file.isDirectory()) {
+            File[] children = file.listFiles();
+            if (children != null) for (File child : children) deleteFolder(child);
+        }
+        if (!file.delete()) Log.w(TAG, "Cannot clean incomplete import " + file);
+    }
+
+    private static void toast(final Activity activity, final String message) {
+        activity.runOnUiThread(new Runnable() {
+            @Override
+            public void run() {
+                Toast.makeText(activity, message, Toast.LENGTH_LONG).show();
+            }
+        });
     }
 
     /** The name the picker showed for the file, or one made from the URI. */

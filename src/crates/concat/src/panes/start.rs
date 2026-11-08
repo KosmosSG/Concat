@@ -296,16 +296,27 @@ impl StartPane {
             // The picker runs with the studio unborrowed and answers as a
             // message of its own; see `host::after_dialog`.
             StartMsg::Browse => {
-                let title = t("start.whereShouldProjectFolder");
-                let current = self.location.clone();
-                crate::host::after_dialog(
-                    move || platform::pick_folder(&title, &current),
-                    |studio, _, _, folder| {
-                        studio.handle(crate::panes::Msg::Start(StartMsg::FolderChosen(
-                            folder.to_string_lossy().into_owned(),
-                        )));
-                    },
+                // Android SAF directory URIs are not ordinary writable filesystem
+                // paths. Letting the user choose one would make Create fail silently.
+                // New projects keep using Concat's app-owned location instead.
+                #[cfg(target_os = "android")]
+                studio.notify(
+                    "Android projects are saved in Concat's app folder. Use Open project to import an existing project.",
+                    false,
                 );
+                #[cfg(not(target_os = "android"))]
+                {
+                    let title = t("start.whereShouldProjectFolder");
+                    let current = self.location.clone();
+                    crate::host::after_dialog(
+                        move || platform::pick_folder(&title, &current),
+                        |studio, _, _, folder| {
+                            studio.handle(crate::panes::Msg::Start(StartMsg::FolderChosen(
+                                folder.to_string_lossy().into_owned(),
+                            )));
+                        },
+                    );
+                }
             }
             StartMsg::FolderChosen(folder) => self.location = folder,
             StartMsg::Create => self.create(studio),
@@ -467,14 +478,31 @@ impl StartPane {
     /// the folder comes back as [`StartMsg::OpenChosen`]; see
     /// `host::after_dialog`.
     fn open(&self) {
-        let title = t("start.openAProject");
-        let current = self.location.clone();
-        crate::host::after_dialog(
-            move || platform::pick_folder(&title, &current),
-            |studio, _, _, folder| {
-                studio.handle(crate::panes::Msg::Start(StartMsg::OpenChosen(folder)));
-            },
-        );
+        #[cfg(target_os = "android")]
+        {
+            // Desktop's synchronous pick_folder is a no-op on Android.
+            // The native SAF chooser responds asynchronously on a Java worker.
+            let _ = slint::invoke_from_event_loop(move || {
+                platform::pick_project_folder_async(move |folder| {
+                    if let Some(folder) = folder {
+                        crate::host::on_ui(move |studio, _, _| {
+                            studio.handle(crate::panes::Msg::Start(StartMsg::OpenChosen(folder)));
+                        });
+                    }
+                });
+            });
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            let title = t("start.openAProject");
+            let current = self.location.clone();
+            crate::host::after_dialog(
+                move || platform::pick_folder(&title, &current),
+                |studio, _, _, folder| {
+                    studio.handle(crate::panes::Msg::Start(StartMsg::OpenChosen(folder)));
+                },
+            );
+        }
     }
 
     /// The folder Open was answered with: checked, then opened. A CapCut

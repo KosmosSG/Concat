@@ -182,15 +182,22 @@ mod java {
         let class = JClass::cast_local(env, class)?;
         // SAFETY: the signature is the Java declaration's, and the
         // function below takes exactly what it names.
-        let method = unsafe {
+        let files_method = unsafe {
             jni::NativeMethod::from_raw_parts(
                 jni_str!("filesPicked"),
                 jni_str!("([Ljava/lang/String;)V"),
                 super::picker::files_picked as *mut c_void,
             )
         };
-        // SAFETY: as above.
-        unsafe { env.register_native_methods(&class, &[method]) }?;
+        // SAFETY: JNI callback signature matches Java's projectFolderPicked(String).
+        let folder_method = unsafe {
+            jni::NativeMethod::from_raw_parts(
+                jni_str!("projectFolderPicked"),
+                jni_str!("(Ljava/lang/String;)V"),
+                super::picker::project_folder_picked as *mut c_void,
+            )
+        };
+        unsafe { env.register_native_methods(&class, &[files_method, folder_method]) }?;
         env.new_global_ref(class)
     }
 }
@@ -217,8 +224,12 @@ mod picker {
     /// The pick in flight, waiting for Java to answer.
     static PENDING: Mutex<Option<Picked>> = Mutex::new(None);
 
+    type PickedFolder = Box<dyn FnOnce(Option<PathBuf>) + Send>;
+    static PENDING_FOLDER: Mutex<Option<PickedFolder>> = Mutex::new(None);
+
     /// Hands the window's crate a picker that runs on this activity.
     pub fn install(app: &AndroidApp) {
+        let folder_app = app.clone();
         let app = app.clone();
         concat::install_file_picker(Box::new(move |kinds, on_picked| {
             let previous = PENDING
@@ -238,6 +249,35 @@ mod picker {
                 }
             }
         }));
+
+        concat::install_project_folder_picker(Box::new(move |on_picked| {
+            let previous = PENDING_FOLDER
+                .lock()
+                .map(|mut slot| slot.replace(on_picked))
+                .ok()
+                .flatten();
+            if let Some(previous) = previous {
+                previous(None);
+            }
+            if let Err(error) = pick_project_folder(&folder_app) {
+                log::error!("could not show the project folder picker: {error}");
+                if let Some(pending) = PENDING_FOLDER.lock().ok().and_then(|mut slot| slot.take()) {
+                    pending(None);
+                }
+            }
+        }));
+    }
+
+    fn pick_project_folder(app: &AndroidApp) -> jni::errors::Result<()> {
+        super::java::with_class(app, |env, activity, class| {
+            env.call_static_method(
+                class,
+                jni_str!("pickProjectFolder"),
+                jni_sig!("(Landroid/app/Activity;)V"),
+                &[activity.into()],
+            )?;
+            Ok(())
+        })
     }
 
     fn pick(app: &AndroidApp, kinds: &concat::PickKinds) -> jni::errors::Result<()> {
@@ -275,6 +315,34 @@ mod picker {
             .filter_map(|(on, kind)| on.then_some(kind))
             .collect(),
             concat::PickKinds::Files(_) => Vec::new(),
+        }
+    }
+
+    /// `ConcatFiles.projectFolderPicked`, on the Java project-import thread.
+    pub(super) unsafe extern "system" fn project_folder_picked(
+        _env: *mut sys::JNIEnv,
+        _class: sys::jclass,
+        path: sys::jstring,
+    ) {
+        let answer = if path.is_null() {
+            None
+        } else {
+            match JavaVM::singleton().and_then(|vm| {
+                vm.attach_current_thread(|env| {
+                    // SAFETY: Java owns this JNI string for the current callback.
+                    let input = unsafe { JString::from_raw(env, path) };
+                    Ok::<_, jni::errors::Error>(PathBuf::from(input.mutf8_chars(env)?.to_string()))
+                })
+            }) {
+                Ok(folder) => Some(folder),
+                Err(error) => {
+                    log::error!("could not read the picked project folder: {error}");
+                    None
+                }
+            }
+        };
+        if let Some(pending) = PENDING_FOLDER.lock().ok().and_then(|mut slot| slot.take()) {
+            pending(answer);
         }
     }
 
